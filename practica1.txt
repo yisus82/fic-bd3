@@ -1,0 +1,331 @@
+1. Descripcion del dominio y modelo relacional asociado:
+
+En este dominio se trata de modelizar de manera sencilla una herramienta de 
+administracion de usarios, programas y servidores.
+
+- Los usuarios tienen asigandos un login y una prioridad. Cuanto menor sea
+el valor 'prioridad' mayor es la prioridad del usuario:
+
+    usuario(NUMBER prioridad, VARCHAR login)
+    PRIMARY KEY: login 
+
+- Los usuarios desean lanzar programas que tienen un determinado coste en 
+recursos. Se entiende que conforme se vayan ejecutando los programas, su
+coste se ira reduciendo progresivamente (la herramienta de administracion se 
+encarga de actualizar esta tabla):
+
+    programa(VARCHAR loginUsuario, VARCHAR nombre, NUMBER coste)
+    PRIMARY KEY: (loginUsuario, nombre)
+    FOREIGN KEY: loginUsuario REFERENCES usuario(login) 
+
+- Por otra parte, se cuenta con servidores donde se ejecutaran los programas.
+Los servidores tienen una determinada capacidad que representa su limitacion 
+en recursos. Ademas, se distingue ente servidores 'restrictivos' y no
+'restrictivos' (mas adelante se comentara las implicaciones de esta division):
+
+    servidor(VARCHAR nombre, NUMBER capacidad, BOOLEAN restrictivo)
+    PRIMARY KEY: nombre
+
+- Los usuarios realizan conexiones a los servidores para ejecutar sus 
+programas (cada programa requiere su propia conexion). El mantenimiento de 
+esta tabla es una tarea de la herramienta de administracion:
+
+    conexion(NUMBER id, VARCHAR loginUsuario, VARCHAR nombrePrograma, 
+		    VARCHAR nombreServidor)
+    PRIMARY KEY: id
+    FOREIGN KEY:(loginUsuario, nombrePrograma) REFERENCES programa(loginUsuario,
+						    nombre)
+		nombreServidor REFERENCES servidor(nombre)
+
+
+La base de datos debe implementar las siguientes reglas de negocio:
+
+1) En un servidor no se pueden estar ejecutando programas cuya suma en coste
+supere la capacidad del servidor.
+
+2) Las prioridades se tratan individualmente para cada servidor: un usuario
+con menos prioridad que otro no puede tener ejecutando en su servidor un
+programa con un coste mayor que el programa que tenga ejecutando el segundo
+usuario.
+
+3) Si un usuario intenta conectarse a un servidor donde no hay capacidad 
+suficiente (el coste de su programa es superior al de que el servidor tiene 
+libre en ese momento), su programa se redirigira a otro servidor donde si
+haya recursos disponibles.
+   NOTA: La tabla servidor no representa los recursos libres de un servidor
+en un momento dado, sino su capacidad. Los recursos libres deben calcularse 
+con una consulta SQL.
+
+4) Cuando un programa tiene coste 0 (es decir, ya ha terminado de ejecutarse),
+ha de borrarse de la relacion 'programa' y, por ende, de la relacion
+'conexion'.
+
+5) En los servidores restrictivos, los usuarios solo pueden tener corriendo
+un programa propio al mismo tiempo. Es decir, no es posible que un mismo
+usuario tenga dos o mas programas conectados a un servidor restrictivo.
+
+
+3. Creacion de tablas y triggers en Oracle
+
+CREATE TABLE usuario (
+	prioridad NUMBER,
+	loginUsuario VARCHAR(10),
+	CONSTRAINT pk_usuario PRIMARY KEY(loginUsuario)
+);
+
+CREATE TABLE programa (
+	loginUsuario VARCHAR(10),
+	nombrePrograma VARCHAR(20),
+	coste NUMBER,
+	CONSTRAINT pk_programa PRIMARY KEY(loginUsuario, nombrePrograma),
+	CONSTRAINT fk_programa_login FOREIGN KEY(loginUsuario) REFERENCES usuario(loginUsuario)
+);
+
+CREATE TABLE servidor (
+	nombreServidor VARCHAR(10),
+	capacidad NUMBER,
+	restrictivo CHAR(1),
+	CONSTRAINT pk_servidor PRIMARY KEY(nombreServidor),
+	CONSTRAINT chk_restrictivo CHECK((restrictivo = 't') OR (restrictivo = 'f'))
+);
+
+CREATE TABLE conexion (
+	identificador NUMBER,
+	loginUsuario VARCHAR(10),
+	nombrePrograma VARCHAR(20),
+	nombreServidor VARCHAR(10),
+	CONSTRAINT pk_conexion PRIMARY KEY(identificador),
+	CONSTRAINT fk_conexion_login_programa FOREIGN KEY(loginUsuario, nombrePrograma)
+		REFERENCES programa(loginUsuario, nombrePrograma),
+	CONSTRAINT fk_conexion_servidor FOREIGN KEY(nombreServidor)
+		REFERENCES servidor(nombreServidor)
+);
+
+/*
+	Llenamos las tablas con datos.
+*/
+
+INSERT INTO usuario
+VALUES(1, 'infjpf02');
+
+INSERT INTO usuario
+VALUES(2, 'infjlr00');
+
+INSERT INTO usuario
+VALUES(3, 'infjps00');
+
+INSERT INTO servidor
+VALUES('alba', 100,'f');
+
+INSERT INTO servidor
+VALUES('oracle', 200,'t');
+
+INSERT INTO servidor
+VALUES('limia', 100,'t');
+
+INSERT INTO programa
+VALUES('infjpf02', 'pico', 10);
+
+INSERT INTO programa
+VALUES('infjpf02', 'office', 110);
+
+INSERT INTO programa
+VALUES('infjpf02', 'firefox', 60);
+
+INSERT INTO programa
+VALUES('infjlr00', 'firefox', 60);
+
+INSERT INTO programa
+VALUES('infjlr00', 'matlab', 90);
+
+INSERT INTO programa
+VALUES('infjps00', 'pico', 10);
+
+INSERT INTO programa
+VALUES('infjps00', 'xeyes', 5);
+
+INSERT INTO programa
+VALUES('infjps00', 'eclipse', 70);
+
+INSERT INTO conexion
+VALUES (1, 'infjpf02', 'firefox', 'oracle');
+
+INSERT INTO conexion
+VALUES (2, 'infjlr00', 'matlab', 'oracle');
+
+/*
+	Funcion para calcular los recursos libres de un servidor.
+*/
+
+CREATE OR REPLACE FUNCTION recursosLibres(nombreServ IN servidor.nombreServidor%TYPE)
+RETURN servidor.capacidad%TYPE
+IS
+	cap servidor.capacidad%TYPE := 0;
+	ocupado servidor.capacidad%TYPE := 0;
+BEGIN
+	SELECT capacidad INTO cap
+	FROM servidor
+	WHERE nombreServidor = nombreServ;
+
+	SELECT NVL(SUM(coste), 0) INTO ocupado
+	FROM programa NATURAL JOIN conexion
+	WHERE nombreServidor = nombreServ;
+
+	RETURN cap - ocupado;
+END;
+
+
+/*
+	Funcion para buscar servidores libres.
+*/
+
+CREATE OR REPLACE FUNCTION buscaServidor(loginUsu IN usuario.loginUsuario%TYPE,
+					nombreProg IN programa.nombrePrograma%TYPE)
+RETURN servidor.nombreServidor%TYPE
+IS
+	costeProg programa.coste%TYPE := 0;
+
+	CURSOR c_servidores_no_restrictivos IS
+		SELECT nombreServidor
+		FROM servidor
+		WHERE restrictivo = 'f'
+		AND recursosLibres(nombreServidor) >= costeProg;
+
+	CURSOR c_servidores_restrictivos IS
+		SELECT nombreServidor
+		FROM servidor
+		WHERE restrictivo = 't'
+		AND recursosLibres(nombreServidor) >= costeProg;
+
+	nombreServ servidor.nombreServidor%TYPE;
+	cont NUMBER := 0;
+BEGIN
+	SELECT coste INTO costeProg
+	FROM programa
+	WHERE nombrePrograma = nombreProg;
+
+	OPEN c_servidores_no_restrictivos;
+
+	LOOP
+		FETCH c_servidores_no_restrictivos INTO nombreServ;
+		EXIT WHEN c_servidores_no_restrictivos%NOTFOUND;
+
+		RETURN nombreServ;
+	END LOOP;
+
+	OPEN c_servidores_restrictivos;
+
+	LOOP
+		FETCH c_servidores_restrictivos INTO nombreServ;
+		EXIT WHEN c_servidores_restrictivos%NOTFOUND;
+
+		SELECT COUNT(*) INTO cont
+		FROM conexion
+		WHERE nombreServidor = nombreServ
+		AND loginUsuario = loginUsu;
+
+		IF cont = 0 THEN
+			RETURN nombreServ;
+		END IF;
+	END LOOP;
+
+	RAISE_APPLICATION_ERROR(-20001, 'No hay servidores disponibles');
+END;
+
+/*
+	En un servidor no se pueden estar ejecutando programas cuya suma en coste
+	supere la capacidad del servidor.
+*/
+CREATE OR REPLACE TRIGGER control_capacidad
+BEFORE INSERT ON conexion
+FOR EACH ROW
+DECLARE
+	costeProg programa.coste%TYPE;
+BEGIN
+	SELECT coste INTO costeProg
+	FROM programa
+	WHERE nombrePrograma = :NEW.nombrePrograma
+	AND loginUsuario = :NEW.loginUsuario;
+
+	IF recursosLibres(:NEW.nombreServidor) < costeProg THEN
+		:NEW.nombreServidor := buscaServidor(:NEW.loginUsuario, :NEW.nombrePrograma);
+	END IF;
+END;
+
+
+/*
+	Las prioridades se tratan individualmente para cada servidor: un usuario
+	con menos prioridad que otro no puede tener ejecutando en su servidor un
+	programa con un coste mayor que el programa que tenga ejecutando el segundo
+	usuario.
+*/
+
+CREATE OR REPLACE TRIGGER control_prioridad
+BEFORE INSERT ON conexion
+FOR EACH ROW
+DECLARE
+	cont NUMBER := 0;
+BEGIN
+	SELECT COUNT(*) INTO cont
+	FROM conexion NATURAL JOIN usuario NATURAL JOIN programa
+	WHERE nombreServidor = :NEW.nombreServidor
+	AND prioridad < (SELECT prioridad FROM usuario WHERE loginUsuario = :NEW.loginUsuario)
+	AND coste < (SELECT coste FROM programa WHERE loginUsuario = :NEW.loginUsuario
+						AND nombrePrograma = :NEW.nombrePrograma);
+
+	IF cont > 0 THEN
+		:NEW.nombreServidor := buscaServidor(:NEW.loginUsuario, :NEW.nombrePrograma);
+	END IF;
+END;
+
+/*
+	Cuando un programa tiene coste 0 (es decir, ya ha terminado de ejecutarse),
+	ha de borrarse de la relacion 'programa' y, por ende, de la relacion
+	'conexion'.
+*/
+
+CREATE OR REPLACE TRIGGER control_coste
+AFTER INSERT OR UPDATE OF coste ON programa
+DECLARE
+	CURSOR c_programa IS
+		SELECT nombrePrograma
+		FROM programa
+		WHERE coste = 0;
+	nombreP programa.nombrePrograma%TYPE;
+BEGIN
+	OPEN c_programa;
+
+	LOOP
+		FETCH c_programa INTO nombreP;
+		EXIT WHEN c_programa%NOTFOUND;
+
+		DELETE FROM conexion
+		WHERE nombrePrograma = nombreP;
+	END LOOP;
+
+	DELETE FROM programa
+	WHERE coste = 0;
+END;
+
+/*
+	En los servidores restrictivos, los usuarios solo pueden tener corriendo
+	un programa propio al mismo tiempo. Es decir, no es posible que un mismo
+	usuario tenga dos o mas programas conectados a un servidor restrictivo.
+*/
+
+CREATE OR REPLACE TRIGGER control_restrictivo
+BEFORE INSERT ON conexion
+FOR EACH ROW
+DECLARE
+	cont NUMBER := 0;
+BEGIN
+	SELECT COUNT(*) INTO cont
+	FROM usuario NATURAL JOIN conexion NATURAL JOIN servidor
+	WHERE restrictivo = 't'
+	AND loginUsuario = :NEW.loginUsuario
+	AND nombreServidor = :NEW.nombreServidor;
+
+	IF cont > 0 THEN
+		:NEW.nombreServidor := buscaServidor(:NEW.loginUsuario, :NEW.nombrePrograma);
+	END IF;
+END;
